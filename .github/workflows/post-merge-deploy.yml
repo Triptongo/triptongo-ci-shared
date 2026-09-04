@@ -1,0 +1,183 @@
+name: Post-Merge Deploy (reusable)
+
+# Reusable workflow — called by each Track App repo's own .github/workflows/deploy.yml
+# via `uses: Triptongo/triptongo-ci-shared/.github/workflows/post-merge-deploy.yml@main`.
+# Never copy this file into a Track App repo — reference it, so a fix here reaches every repo at once.
+#
+# Public repo on purpose: reusable workflows can't be shared across GitHub owners (org/user
+# accounts) when private — only "same owner" or "public". This lets Track Apps outside the
+# Triptongo org (personal projects, client repos under a different account) still call it.
+# Nothing sensitive lives here — everything secret comes in via `secrets:`/`inputs:` from the
+# caller. See triptongo-dev-playbook for the methodology docs (CLAUDE.md templates, ADRs,
+# agent profiles), which stays private — this repo is only the generic deploy mechanics.
+#
+# Verifies migrations against the real schema (PRAGMA table_info), not against wrangler's own
+# `d1_migrations` bookkeeping table — that table has been observed reporting a migration as applied
+# when the DDL never ran. See "Post-Merge: Deploy y Migraciones" in each Track App's CLAUDE.md
+# for the incident this workflow exists to prevent.
+#
+# Migrations are applied BEFORE the Worker deploys: deploying first would open a window where new
+# code assumes a schema the database doesn't have yet.
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: "Named Wrangler environment to deploy: staging or production"
+        required: true
+        type: string
+      ref:
+        description: "Commit SHA to check out and deploy (pass github.event.workflow_run.head_sha from the caller so this deploys exactly what CI validated, not whatever HEAD drifted to)"
+        required: false
+        type: string
+        default: ""
+      deploy_api:
+        description: "Whether apps/api changed and should be deployed"
+        required: true
+        type: boolean
+      deploy_dashboard:
+        description: "Whether apps/dashboard changed and should be deployed"
+        required: true
+        type: boolean
+      deploy_portal:
+        description: "Whether apps/portal changed and should be deployed (optional — only Track Apps with a third frontend pass this)"
+        required: false
+        type: boolean
+        default: false
+      deploy_client_portal:
+        description: "Whether apps/client-portal changed and should be deployed (optional — only Track Apps with a fourth frontend pass this)"
+        required: false
+        type: boolean
+        default: false
+      d1_database_name:
+        description: "D1 database name for this environment (empty skips migrations)"
+        required: false
+        type: string
+        default: ""
+      migrations_dir:
+        description: "Path to the migrations directory"
+        required: false
+        type: string
+        default: "apps/api/migrations"
+      wrangler_config:
+        description: "Path to the API Worker's wrangler.toml — the D1 steps run from the repo root, so wrangler needs this to find the right config instead of relying on cwd discovery"
+        required: false
+        type: string
+        default: "apps/api/wrangler.toml"
+      api_health_url:
+        description: "Health check URL for the API in this environment (empty skips the smoke check)"
+        required: false
+        type: string
+        default: ""
+    secrets:
+      CLOUDFLARE_API_TOKEN:
+        required: true
+      CLOUDFLARE_ACCOUNT_ID:
+        required: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    # GitHub Environment protection rules (required reviewers) live in each repo's own
+    # Settings -> Environments -> production. This job pauses for approval there if configured —
+    # nothing to set up in this workflow file itself.
+    environment: ${{ inputs.environment }}
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      DEPLOY_ENV: ${{ inputs.environment }}
+      D1_DATABASE_NAME: ${{ inputs.d1_database_name }}
+      MIGRATIONS_DIR: ${{ inputs.migrations_dir }}
+      WRANGLER_CONFIG: ${{ inputs.wrangler_config }}
+      API_HEALTH_URL: ${{ inputs.api_health_url }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: ".nvmrc"
+          # No `cache: npm` here on purpose: setup-node's npm cache restores a
+          # prior ~/.npm content cache, and a stale/partial packument in it has
+          # been observed making `npm ci` report an optional transitive dep
+          # (e.g. @emnapi/runtime, pulled in by native-binding packages) as
+          # missing from an otherwise-synced lockfile — reproduced on a Track
+          # App 2026-07-19: CI failed with a restored cache, a clean clone of
+          # the same commit installed fine. Deploy runs are infrequent, so a
+          # cold `npm ci` here is worth the reliability.
+
+      - run: npm ci
+
+      - name: Apply D1 migrations
+        if: inputs.deploy_api && inputs.d1_database_name != ''
+        run: npx wrangler d1 migrations apply "$D1_DATABASE_NAME" --config "$WRANGLER_CONFIG" --env "$DEPLOY_ENV" --remote
+
+      - name: Verify migrations against real schema (PRAGMA table_info)
+        if: inputs.deploy_api && inputs.d1_database_name != ''
+        shell: bash
+        run: |
+          set -e
+          shopt -s nullglob
+          pairs_file=$(mktemp)
+
+          for f in "$MIGRATIONS_DIR"/*.sql; do
+            while IFS= read -r line; do
+              table=$(echo "$line" | grep -oP '(?<=table=)[a-zA-Z0-9_]+' || true)
+              column=$(echo "$line" | grep -oP '(?<=column=)[a-zA-Z0-9_]+' || true)
+              if [ -z "$table" ] || [ -z "$column" ]; then
+                echo "::error::$f has a malformed '-- verify:' line ('$line') — expected exactly 'table=<name> column=<name>'."
+                exit 1
+              fi
+              echo "$table $column" >> "$pairs_file"
+            done < <(grep -oP -- '^-- verify:.*' "$f" || true)
+          done
+
+          if [ ! -s "$pairs_file" ]; then
+            echo "::warning::No migration in $MIGRATIONS_DIR declares a '-- verify: table=X column=Y' header — nothing was checked against the real schema. See docs/00-playbook.md for the annotation convention."
+            rm -f "$pairs_file"
+            exit 0
+          fi
+
+          checked=0
+          for table in $(cut -d' ' -f1 "$pairs_file" | sort -u); do
+            echo "Fetching schema for $table"
+            result=$(npx wrangler d1 execute "$D1_DATABASE_NAME" --config "$WRANGLER_CONFIG" --env "$DEPLOY_ENV" --remote --json --command "PRAGMA table_info($table);")
+            actual_columns=$(echo "$result" | jq -r '.[0].results[].name')
+            while IFS= read -r column; do
+              checked=$((checked + 1))
+              echo "Verifying $table.$column"
+              if ! echo "$actual_columns" | grep -qx "$column"; then
+                echo "::error::A migration declares $table.$column but PRAGMA table_info($table) does not show that column in $DEPLOY_ENV. wrangler d1 migrations list may say this migration is applied even though the DDL never ran — that mismatch is the known failure mode, not a fluke. Investigate before assuming the migration succeeded."
+                rm -f "$pairs_file"
+                exit 1
+              fi
+            done < <(awk -v t="$table" '$1==t {print $2}' "$pairs_file")
+          done
+          rm -f "$pairs_file"
+          echo "Verified $checked column(s) against the real schema."
+
+      - name: Deploy API Worker
+        if: inputs.deploy_api
+        run: npm -w apps/api run "deploy:$DEPLOY_ENV"
+
+      - name: Smoke check API
+        if: inputs.deploy_api && inputs.api_health_url != ''
+        run: |
+          status=$(curl -s -o /dev/null -w "%{http_code}" "$API_HEALTH_URL")
+          if [ "$status" != "200" ]; then
+            echo "::error::Health check failed for $API_HEALTH_URL (HTTP $status)"
+            exit 1
+          fi
+
+      - name: Deploy Dashboard
+        if: inputs.deploy_dashboard
+        run: npm -w apps/dashboard run "deploy:$DEPLOY_ENV"
+
+      - name: Deploy Portal
+        if: inputs.deploy_portal
+        run: npm -w apps/portal run "deploy:$DEPLOY_ENV"
+
+      - name: Deploy Client Portal
+        if: inputs.deploy_client_portal
+        run: npm -w apps/client-portal run "deploy:$DEPLOY_ENV"
