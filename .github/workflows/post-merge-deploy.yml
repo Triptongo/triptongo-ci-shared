@@ -75,6 +75,15 @@ on:
       CLOUDFLARE_ACCOUNT_ID:
         required: true
 
+# `npm ci` needs to read GitHub Packages for @triptongo/* scoped deps (see .npmrc in each Track
+# App). `packages: read` here only sets the ceiling — the calling job's own `permissions:` block
+# (in each repo's deploy.yml/deploy-production.yml) must also grant `packages: read`, or the
+# effective token stays read-only on contents and npm ci 401s. contents:read is the default this
+# workflow needs to check out the ref.
+permissions:
+  contents: read
+  packages: read
+
 jobs:
   deploy:
     runs-on: ubuntu-latest
@@ -108,6 +117,10 @@ jobs:
           # cold `npm ci` here is worth the reliability.
 
       - run: npm ci
+        env:
+          # @triptongo/* scoped deps resolve from GitHub Packages per each Track App's .npmrc
+          # (`@triptongo:registry=https://npm.pkg.github.com`) — without this, npm ci 401s.
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Apply D1 migrations
         if: inputs.deploy_api && inputs.d1_database_name != ''
