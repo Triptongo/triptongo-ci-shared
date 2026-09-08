@@ -100,11 +100,11 @@ jobs:
       WRANGLER_CONFIG: ${{ inputs.wrangler_config }}
       API_HEALTH_URL: ${{ inputs.api_health_url }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           ref: ${{ inputs.ref || github.sha }}
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version-file: ".nvmrc"
           # No `cache: npm` here on purpose: setup-node's npm cache restores a
