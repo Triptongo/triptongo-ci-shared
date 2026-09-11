@@ -224,7 +224,15 @@ jobs:
             method=$(echo "$entry" | jq -r '.method // "GET"')
             desc=$(echo "$entry" | jq -r '.description // .url')
 
-            status=$(curl -s -o /dev/null -w "%{http_code}" -X "$method" "${auth_header[@]}" "$url")
+            # No encadenar directo con `set -e`: si curl no puede conectar (timeout,
+            # DNS, connection refused) sale con exit code no-cero aunque escriba
+            # "000" vía -w, y eso abortaría el script acá mismo, saltando en
+            # silencio el resto de los endpoints todavía sin chequear.
+            if ! status=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 --connect-timeout 5 -X "$method" "${auth_header[@]}" "$url"); then
+              echo "::error::Smoke check failed for '$desc' ($url): curl no pudo completar el request (timeout/conexión)"
+              failed=1
+              continue
+            fi
             echo "[$method] $desc -> HTTP $status"
             if [ "$status" -ge 500 ]; then
               echo "::error::Smoke check failed for '$desc' ($url): HTTP $status"
