@@ -69,11 +69,28 @@ on:
         required: false
         type: string
         default: ""
+      smoke_endpoints:
+        description: >-
+          JSON array of endpoints to hit after deploy and fail on 5xx, beyond the single
+          api_health_url check above. Each entry: {"method": "GET", "url": "https://...",
+          "description": "..."}. `method` defaults to GET. Unauthenticated requests only reach
+          past auth middleware if the endpoint allows it — to smoke-check an endpoint gated by
+          auth (e.g. an admin route with a JOIN, the exact class of bug this exists for), pass
+          the SMOKE_TEST_TOKEN secret below; it's sent as `Authorization: Bearer <token>` on
+          every entry. A non-5xx response (401/403/404 included) counts as pass — this only
+          catches the server crashing while handling the request, not authz/authn correctness.
+          Empty array (default) skips this step entirely.
+        required: false
+        type: string
+        default: "[]"
     secrets:
       CLOUDFLARE_API_TOKEN:
         required: true
       CLOUDFLARE_ACCOUNT_ID:
         required: true
+      SMOKE_TEST_TOKEN:
+        description: "Optional bearer token sent on every smoke_endpoints request, for endpoints behind auth"
+        required: false
 
 # `npm ci` needs to read GitHub Packages for @triptongo/* scoped deps (see .npmrc in each Track
 # App). `packages: read` here only sets the ceiling — the calling job's own `permissions:` block
@@ -99,6 +116,8 @@ jobs:
       MIGRATIONS_DIR: ${{ inputs.migrations_dir }}
       WRANGLER_CONFIG: ${{ inputs.wrangler_config }}
       API_HEALTH_URL: ${{ inputs.api_health_url }}
+      SMOKE_ENDPOINTS: ${{ inputs.smoke_endpoints }}
+      SMOKE_TEST_TOKEN: ${{ secrets.SMOKE_TEST_TOKEN }}
     steps:
       - uses: actions/checkout@v5
         with:
@@ -180,6 +199,40 @@ jobs:
           status=$(curl -s -o /dev/null -w "%{http_code}" "$API_HEALTH_URL")
           if [ "$status" != "200" ]; then
             echo "::error::Health check failed for $API_HEALTH_URL (HTTP $status)"
+            exit 1
+          fi
+
+      - name: Smoke check endpoints touched by this deploy
+        if: inputs.deploy_api && inputs.smoke_endpoints != '[]'
+        shell: bash
+        run: |
+          set -e
+          count=$(echo "$SMOKE_ENDPOINTS" | jq 'length')
+          if [ "$count" -eq 0 ]; then
+            exit 0
+          fi
+
+          auth_header=()
+          if [ -n "$SMOKE_TEST_TOKEN" ]; then
+            auth_header=(-H "Authorization: Bearer $SMOKE_TEST_TOKEN")
+          fi
+
+          failed=0
+          for i in $(seq 0 $((count - 1))); do
+            entry=$(echo "$SMOKE_ENDPOINTS" | jq ".[$i]")
+            url=$(echo "$entry" | jq -r '.url')
+            method=$(echo "$entry" | jq -r '.method // "GET"')
+            desc=$(echo "$entry" | jq -r '.description // .url')
+
+            status=$(curl -s -o /dev/null -w "%{http_code}" -X "$method" "${auth_header[@]}" "$url")
+            echo "[$method] $desc -> HTTP $status"
+            if [ "$status" -ge 500 ]; then
+              echo "::error::Smoke check failed for '$desc' ($url): HTTP $status"
+              failed=1
+            fi
+          done
+
+          if [ "$failed" -eq 1 ]; then
             exit 1
           fi
 
