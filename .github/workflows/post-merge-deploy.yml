@@ -75,21 +75,41 @@ on:
           api_health_url check above. Each entry: {"method": "GET", "url": "https://...",
           "description": "..."}. `method` defaults to GET. Unauthenticated requests only reach
           past auth middleware if the endpoint allows it — to smoke-check an endpoint gated by
-          auth (e.g. an admin route with a JOIN, the exact class of bug this exists for), pass
-          the SMOKE_TEST_TOKEN secret below; it's sent as `Authorization: Bearer <token>` on
-          every entry. A non-5xx response (401/403/404 included) counts as pass — this only
-          catches the server crashing while handling the request, not authz/authn correctness.
-          Empty array (default) skips this step entirely.
+          auth (e.g. an admin route with a JOIN, the exact class of bug this exists for), either
+          pass the static SMOKE_TEST_TOKEN secret below, or (for a short-lived access token that
+          a static secret can't cover) set login_url + SMOKE_TEST_EMAIL/SMOKE_TEST_PASSWORD to
+          fetch a fresh one right before this step. A non-5xx response (401/403/404 included)
+          counts as pass — this only catches the server crashing while handling the request, not
+          authz/authn correctness. Empty array (default) skips this step entirely.
         required: false
         type: string
         default: "[]"
+      login_url:
+        description: >-
+          Optional login endpoint to fetch a fresh bearer token right before the smoke_endpoints
+          step, for a short-lived access token that a static SMOKE_TEST_TOKEN secret can't cover
+          (a JWT that expires in minutes, say). POSTs {"email","password"} as JSON and expects
+          the canonical Triptongo envelope back: {"success":true,"data":{"access_token":"..."}}.
+          Requires SMOKE_TEST_EMAIL/SMOKE_TEST_PASSWORD secrets. When set, the token this
+          produces is used instead of the static SMOKE_TEST_TOKEN secret for smoke_endpoints
+          (not in addition to it) — set at most one of the two mechanisms. Empty (default) skips
+          this step; smoke_endpoints then falls back to the static SMOKE_TEST_TOKEN secret, if any.
+        required: false
+        type: string
+        default: ""
     secrets:
       CLOUDFLARE_API_TOKEN:
         required: true
       CLOUDFLARE_ACCOUNT_ID:
         required: true
       SMOKE_TEST_TOKEN:
-        description: "Optional bearer token sent on every smoke_endpoints request, for endpoints behind auth"
+        description: "Optional static bearer token sent on every smoke_endpoints request, for endpoints behind auth with a non-expiring credential. Ignored if login_url is set."
+        required: false
+      SMOKE_TEST_EMAIL:
+        description: "Email for the login_url flow above — required if login_url is set"
+        required: false
+      SMOKE_TEST_PASSWORD:
+        description: "Password for the login_url flow above — required if login_url is set"
         required: false
 
 # `npm ci` needs to read GitHub Packages for @triptongo/* scoped deps (see .npmrc in each Track
@@ -118,6 +138,9 @@ jobs:
       API_HEALTH_URL: ${{ inputs.api_health_url }}
       SMOKE_ENDPOINTS: ${{ inputs.smoke_endpoints }}
       SMOKE_TEST_TOKEN: ${{ secrets.SMOKE_TEST_TOKEN }}
+      LOGIN_URL: ${{ inputs.login_url }}
+      SMOKE_TEST_EMAIL: ${{ secrets.SMOKE_TEST_EMAIL }}
+      SMOKE_TEST_PASSWORD: ${{ secrets.SMOKE_TEST_PASSWORD }}
     steps:
       - uses: actions/checkout@v5
         with:
@@ -201,6 +224,36 @@ jobs:
             echo "::error::Health check failed for $API_HEALTH_URL (HTTP $status)"
             exit 1
           fi
+
+      - name: Log in for authenticated smoke checks
+        if: inputs.deploy_api && inputs.smoke_endpoints != '[]' && inputs.login_url != ''
+        shell: bash
+        run: |
+          set -e
+          if [ -z "$SMOKE_TEST_EMAIL" ] || [ -z "$SMOKE_TEST_PASSWORD" ]; then
+            echo "::error::login_url is set but SMOKE_TEST_EMAIL/SMOKE_TEST_PASSWORD secrets are missing"
+            exit 1
+          fi
+
+          response=$(curl -s --max-time 10 --connect-timeout 5 -X POST \
+            -H "Content-Type: application/json" \
+            -d "{\"email\":\"$SMOKE_TEST_EMAIL\",\"password\":\"$SMOKE_TEST_PASSWORD\"}" \
+            "$LOGIN_URL")
+          token=$(echo "$response" | jq -r '.data.access_token // empty')
+
+          if [ -z "$token" ]; then
+            # No se loguea $response completo: si el login falla por credenciales, el
+            # error de la API puede repetir el email en texto plano — no hace falta
+            # para diagnosticar, y menos superficie es mejor acá.
+            echo "::error::Login contra $LOGIN_URL no devolvió .data.access_token — ¿credenciales vencidas, cuenta inactiva, o la API no respeta el envelope {success,data} esperado?"
+            exit 1
+          fi
+
+          # Pisa el SMOKE_TEST_TOKEN del entorno del job (viene de un secret estático,
+          # si se pasó) para los steps siguientes — con login_url seteado, el token
+          # fresco de acá es el que se usa, nunca ambos a la vez.
+          echo "::add-mask::$token"
+          echo "SMOKE_TEST_TOKEN=$token" >> "$GITHUB_ENV"
 
       - name: Smoke check endpoints touched by this deploy
         if: inputs.deploy_api && inputs.smoke_endpoints != '[]'
